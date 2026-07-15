@@ -1,84 +1,91 @@
-"""Skeleton: prosodic features + classifier. Runs as-is, scores poorly ON
-PURPOSE. Your hour goes into extract_features() and what you learn from
-your errors.
-
+"""
     python train.py --data_dir eot_data/english --out predictions.csv
-
-Ideas worth testing (this is the assignment, not a checklist):
-  - F0 slope over the last voiced region (statements fall, continuations
-    often stay level or rise)
-  - final-syllable lengthening: last voiced stretch duration vs the
-    speaker's average
-  - energy decay rate into the pause
-  - speaking-rate context, position of the pause within the turn so far
-  - anything you discover by LISTENING to your misclassified pauses
 """
 import argparse
 import csv
 import os
+from collections import defaultdict
 
 import numpy as np
+import joblib
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GroupKFold, cross_val_predict
 
 from features import load_wav, speech_before, frame_energy_db, f0_contour
-
-
-def extract_features(x, sr, pause_start):
-    """Features from audio STRICTLY BEFORE pause_start.  <-- YOUR WORK"""
-    seg = speech_before(x, sr, pause_start, window_s=1.5)
-    if len(seg) < sr // 10:
-        return np.zeros(3, dtype=np.float32)
-    e = frame_energy_db(seg, sr)
-    f0 = f0_contour(seg, sr)
-    voiced = f0[f0 > 0]
-    # deliberately weak starter features:
-    return np.array([
-        e[-5:].mean(),                       # energy right before the pause
-        voiced[-3:].mean() if len(voiced) >= 3 else 0.0,   # final pitch
-        len(seg) / sr,                       # how much speech context we had
-    ], dtype=np.float32)
+from extract_features import extract_features  # or keep in this file
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--out", default="predictions.csv")
+    ap.add_argument("--model_out", default="model.joblib")
+    ap.add_argument("--C", type=float, default=0.5)
     args = ap.parse_args()
 
     rows = list(csv.DictReader(open(os.path.join(args.data_dir, "labels.csv"))))
+    rows.sort(key=lambda r: (r["turn_id"], int(r["pause_index"])))
+
     cache = {}
+    turn_prev_durs = defaultdict(list)
     X, y, groups, keys = [], [], [], []
+
     for r in rows:
         path = os.path.join(args.data_dir, r["audio_file"])
         if path not in cache:
             cache[path] = load_wav(path)
         x, sr = cache[path]
-        X.append(extract_features(x, sr, float(r["pause_start"])))
+
+        tid = r["turn_id"]
+        pidx = int(r["pause_index"])
+        pause_start = float(r["pause_start"])
+
+        feat = extract_features(x, sr, pause_start, pidx, turn_prev_durs[tid])
+        X.append(feat)
         y.append(1 if r["label"] == "eot" else 0)
-        groups.append(r["turn_id"])
-        keys.append((r["turn_id"], r["pause_index"]))
+        groups.append(tid)
+        keys.append((tid, r["pause_index"]))
+
+        turn_prev_durs[tid].append(float(r["pause_end"]) - pause_start)
+
     X, y = np.array(X), np.array(y)
+    groups = np.array(groups)
 
-    # quick sanity check on held-out TURNS (never split a turn across sets)
-    tr, te = next(GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=0)
-                  .split(X, y, groups))
-    clf = LogisticRegression(max_iter=1000, class_weight="balanced")
-    clf.fit(X[tr], y[tr])
-    print(f"held-out turn accuracy: {clf.score(X[te], y[te]):.3f} "
-          f"(chance ~ {max(np.mean(y), 1-np.mean(y)):.3f})")
+    n_turns = len(set(groups))
+    n_splits = min(5, n_turns)
 
-    # refit on everything, write predictions for the scorer
-    clf.fit(X, y)
-    p = clf.predict_proba(X)[:, 1]
+    def make_clf():
+        return make_pipeline(
+            StandardScaler(),
+            LogisticRegression(max_iter=1000, C=args.C, class_weight="balanced"),
+        )
+
+    # --- HONEST dev-time predictions: out-of-sample via GroupKFold CV ---
+    gkf = GroupKFold(n_splits=n_splits)
+    p_oos = cross_val_predict(
+        make_clf(), X, y, groups=groups, cv=gkf, method="predict_proba"
+    )[:, 1]
+
+    acc_oos = ((p_oos >= 0.5).astype(int) == y).mean()
+    print(f"out-of-sample accuracy: {acc_oos:.3f} "
+          f"(chance ~ {max(np.mean(y), 1 - np.mean(y)):.3f})  C={args.C}")
+
     with open(args.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["turn_id", "pause_index", "p_eot"])
-        for (tid, pi), pi_p in zip(keys, p):
+        for (tid, pi), pi_p in zip(keys, p_oos):
             w.writerow([tid, pi, f"{pi_p:.4f}"])
-    print(f"wrote {len(keys)} predictions -> {args.out}")
-    print("NOTE for your final predict.py: it must load a SAVED model and "
-          "predict on unseen data, not refit like this sanity script.")
+    print(f"wrote {len(keys)} OUT-OF-SAMPLE predictions -> {args.out}  "
+          f"(use this file with score.py during development)")
+
+    # --- final model: refit on ALL data, save for predict.py ---
+    final_clf = make_clf()
+    final_clf.fit(X, y)
+    joblib.dump(final_clf, args.model_out)
+    print(f"saved final model (fit on all data) -> {args.model_out}  "
+          f"(this is what predict.py will load)")
 
 
 if __name__ == "__main__":
